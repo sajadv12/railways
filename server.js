@@ -20,6 +20,10 @@ if (!TARGET) {
 const server = http.createServer((req, res) => {
   try {
     const targetUrl = new URL(TARGET + req.url);
+    const isHttps = targetUrl.protocol === "https:";
+    const port = targetUrl.port
+      ? parseInt(targetUrl.port)
+      : isHttps ? 443 : 80;
 
     const headers = {};
     for (const [key, value] of Object.entries(req.headers)) {
@@ -29,15 +33,19 @@ const server = http.createServer((req, res) => {
     }
     headers["host"] = targetUrl.hostname;
 
+    const path = targetUrl.pathname + (targetUrl.search || "");
+
     const options = {
       hostname: targetUrl.hostname,
-      port: targetUrl.port || 443,
-      path: targetUrl.pathname + targetUrl.search,
+      port,
+      path,
       method: req.method,
       headers,
+      // Disable connection pooling for long-lived xhttp streams
+      agent: false,
     };
 
-    const proto = targetUrl.protocol === "https:" ? https : http;
+    const proto = isHttps ? https : http;
 
     const proxy = proto.request(options, (upstream) => {
       const responseHeaders = {};
@@ -48,7 +56,10 @@ const server = http.createServer((req, res) => {
       responseHeaders["cache-control"] = "no-store";
 
       res.writeHead(upstream.statusCode, responseHeaders);
+
+      // Stream response back, handle early client disconnect
       upstream.pipe(res);
+      res.on("close", () => upstream.destroy());
     });
 
     proxy.on("error", (err) => {
@@ -59,14 +70,22 @@ const server = http.createServer((req, res) => {
       }
     });
 
+    // Stream request body to upstream, handle early upstream disconnect
     req.pipe(proxy);
+    proxy.on("close", () => req.destroy());
 
   } catch (err) {
     console.error("Handler error:", err.message);
-    res.writeHead(500);
-    res.end("Internal Server Error");
+    if (!res.headersSent) {
+      res.writeHead(500);
+      res.end("Internal Server Error");
+    }
   }
 });
+
+// Support long-lived streaming connections (xhttp)
+server.timeout = 0;
+server.keepAliveTimeout = 0;
 
 server.listen(PORT, () => {
   console.log(`Relay running on port ${PORT} → ${TARGET}`);
